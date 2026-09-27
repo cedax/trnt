@@ -6,7 +6,7 @@ import express from 'express'
 import WebTorrent from 'webtorrent'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PORT = Number(process.env.PORT || 3000)
+const PORT = Number(process.env.PORT || 3250)
 const TORRENT_PORT = Number(process.env.TORRENT_PORT || 6881)
 const DOWNLOAD_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'))
 
