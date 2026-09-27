@@ -16,7 +16,7 @@ const APP_PASSWORD = 'cambia-esta-clave'
 const SESSION_SECRET = 'cambia-tambien-esta-frase-larga-y-privada'
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000
-const SEEDER_TIMEOUT_MS = 35_000
+const SEEDER_TIMEOUT_MS = 90_000
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.ogv'])
 const MIME_TYPES = {
   '.mp4': 'video/mp4',
@@ -118,6 +118,7 @@ function formatTorrent(torrent, job) {
 }
 
 function wireHasEveryPiece(wire, pieceCount) {
+  if (wire?.isSeeder) return true
   if (!wire?.peerPieces || !pieceCount) return false
   for (let index = 0; index < pieceCount; index += 1) {
     if (!wire.peerPieces.get(index)) return false
@@ -176,6 +177,7 @@ function waitForSeeder(torrent, job) {
     beginDownload()
     wire.on('bitfield', beginDownload)
     wire.on('have', beginDownload)
+    wire.on('have-all', beginDownload)
   }
 
   torrent.wires.forEach(watchWire)

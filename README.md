@@ -46,6 +46,6 @@ Para uso real, pon Nginx o Caddy delante con HTTPS y no expongas el puerto 3000 
 
 ## Notas
 
-- La verificación espera hasta 35 segundos por un par que tenga el torrent completo. Si no aparece, no selecciona ni descarga piezas.
+- La verificación espera hasta 90 segundos por un par que tenga el torrent completo. Reconoce anuncios normales y el mensaje rápido `have-all`; si no aparece ninguno, no selecciona ni descarga piezas.
 - MP4 y WebM suelen reproducirse en todos los navegadores. MKV/AVI dependen de los códecs del navegador; la app no transcodifica para mantenerse ligera.
 - Usa la aplicación únicamente con contenido que tengas derecho a descargar y compartir.
