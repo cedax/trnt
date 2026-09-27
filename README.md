@@ -1,12 +1,14 @@
 # Magnet Box
 
-App privada y mínima para pegar enlaces magnet, comprobar que exista al menos un seeder completo, descargar a disco y reproducir videos desde el navegador.
+App privada y mínima para pegar enlaces magnet, comprobar que existan pares con piezas útiles, descargar a disco y reproducir videos desde el navegador.
 
 Cada descarga activa puede pausarse y reanudarse. Al cancelar, el torrent se detiene, se quita de la lista y se eliminan sus archivos parciales.
 
 Los videos se muestran como una galería adaptable con miniaturas. En computadora se previsualizan al dejar el mouse encima; en Android, al mantener presionada la miniatura.
 
 Si agregas nuevamente el mismo magnet, la app verifica los datos que ya existen y descarga únicamente los archivos o fragmentos faltantes. Los archivos completos reutilizados tampoco se eliminan al cancelar una reanudación.
+
+El estado se guarda en `downloads/.magnet-box-state.json`: magnets, metadatos del torrent, piezas verificadas, pausa y fechas de modificación. Al reiniciar el servicio, las descargas se restauran automáticamente y los archivos sin cambios usan una verificación rápida en lugar de recalcular todos sus hashes.
 
 ## Antes de ejecutarla
 
@@ -29,7 +31,7 @@ npm install
 npm start
 ```
 
-Abre `http://IP-DEL-SERVIDOR:3000`. Los archivos se guardan en `./downloads`. Puedes cambiar la ruta con `DOWNLOAD_DIR=/ruta/grande`, el puerto web con `PORT=3000` y el puerto BitTorrent con `TORRENT_PORT=6881`.
+Abre `http://IP-DEL-SERVIDOR:3250`. Los archivos se guardan en `./downloads`. Puedes cambiar la ruta con `DOWNLOAD_DIR=/ruta/grande`, el puerto web con `PORT=3250` y el puerto BitTorrent con `TORRENT_PORT=6881`.
 
 ## EC2
 
@@ -42,10 +44,10 @@ pm2 save
 pm2 startup
 ```
 
-Para uso real, pon Nginx o Caddy delante con HTTPS y no expongas el puerto 3000 públicamente. Abre TCP y UDP `6881` (o el valor de `TORRENT_PORT`) en el grupo de seguridad para mejorar la conectividad entre pares.
+Para uso real, pon Nginx o Caddy delante con HTTPS y no expongas el puerto 3250 públicamente. Abre TCP y UDP `6881` (o el valor de `TORRENT_PORT`) en el grupo de seguridad para mejorar la conectividad entre pares.
 
 ## Notas
 
-- La verificación espera hasta 90 segundos por un par que tenga el torrent completo. Reconoce anuncios normales y el mensaje rápido `have-all`; si no aparece ninguno, no selecciona ni descarga piezas.
+- La app espera hasta 90 segundos por pares que tengan piezas faltantes. Si aún no aparecen, mantiene el torrent en espera y continúa buscando sin descargar datos inútiles.
 - MP4 y WebM suelen reproducirse en todos los navegadores. MKV/AVI dependen de los códecs del navegador; la app no transcodifica para mantenerse ligera.
 - Usa la aplicación únicamente con contenido que tengas derecho a descargar y compartir.

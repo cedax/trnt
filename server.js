@@ -9,6 +9,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.PORT || 3250)
 const TORRENT_PORT = Number(process.env.TORRENT_PORT || 6881)
 const DOWNLOAD_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'))
+const STATE_FILE = path.join(DOWNLOAD_DIR, '.magnet-box-state.json')
 
 // Cambia estos tres valores antes de publicar la aplicación.
 const APP_USER = 'admin'
@@ -34,8 +35,52 @@ const app = express()
 // TCP funciona en EC2 sin depender del módulo uTP nativo ni de permisos locales extra.
 const client = new WebTorrent({ utp: false, torrentPort: TORRENT_PORT, dhtPort: TORRENT_PORT })
 const jobs = new Map()
+let stateSaveTimer = null
+let stateWriteQueue = Promise.resolve()
 
 client.on('error', (error) => console.error('WebTorrent:', error.message))
+
+function encodeBytes(value) {
+  return value ? Buffer.from(value).toString('base64') : null
+}
+
+function scheduleStateSave(delay = 500) {
+  clearTimeout(stateSaveTimer)
+  stateSaveTimer = setTimeout(() => saveStateNow(), delay)
+  stateSaveTimer.unref?.()
+}
+
+async function captureFileModtimes(job) {
+  if (!job.torrent?.ready || job.torrent.destroyed) return
+  job.fileModtimes = await new Promise((resolve) => {
+    job.torrent.getFileModtimes((error, values) => resolve(error ? null : values))
+  })
+}
+
+async function saveStateNow() {
+  const records = [...jobs.values()].map((job) => {
+    const torrent = job.torrent
+    return {
+      magnet: job.magnet,
+      paused: job.status === 'pausado',
+      complete: job.status === 'completo',
+      bitfield: torrent?.bitfield ? encodeBytes(torrent.bitfield.buffer) : job.cachedBitfield,
+      torrentFile: torrent?.torrentFile ? encodeBytes(torrent.torrentFile) : job.cachedTorrentFile,
+      announce: torrent?.announce || job.cachedAnnounce || [],
+      fileModtimes: job.fileModtimes || null,
+      updatedAt: Date.now()
+    }
+  })
+  const contents = JSON.stringify({ version: 1, torrents: records }, null, 2)
+  stateWriteQueue = stateWriteQueue
+    .catch(() => {})
+    .then(() => fs.promises.writeFile(STATE_FILE, contents, { encoding: 'utf8', mode: 0o600 }))
+    .catch((error) => console.error('No se pudo guardar el estado:', error.message))
+  return stateWriteQueue
+}
+
+const stateCheckpoint = setInterval(() => scheduleStateSave(0), 10_000)
+stateCheckpoint.unref?.()
 
 app.set('trust proxy', 1)
 app.disable('x-powered-by')
@@ -117,18 +162,17 @@ function formatTorrent(torrent, job) {
   }
 }
 
-function wireHasEveryPiece(wire, pieceCount) {
-  if (wire?.isSeeder) return true
-  if (!wire?.peerPieces || !pieceCount) return false
-  for (let index = 0; index < pieceCount; index += 1) {
-    if (!wire.peerPieces.get(index)) return false
+function wireHasUsefulPiece(torrent, wire) {
+  if (!wire?.peerPieces || !torrent.pieces?.length) return false
+  for (let index = 0; index < torrent.pieces.length; index += 1) {
+    if (!torrent.bitfield?.get(index) && wire.peerPieces.get(index)) return true
   }
-  return true
+  return false
 }
 
-function waitForSeeder(torrent, job) {
+function waitForSources(torrent, job) {
   let started = false
-  let seederFound = false
+  let sourceFound = false
 
   const selectMissingFiles = () => {
     if (started || torrent.destroyed) return
@@ -140,6 +184,16 @@ function waitForSeeder(torrent, job) {
       job.existingOnly = true
       job.status = 'completo'
       job.message = 'Todos los archivos ya existían completos. No se descargó nada.'
+      captureFileModtimes(job).then(() => scheduleStateSave())
+      return
+    }
+
+    if (job.restorePaused) {
+      started = true
+      job.status = 'pausado'
+      job.message = 'Descarga restaurada en pausa. Los archivos verificados se conservaron.'
+      torrent.pause()
+      scheduleStateSave()
       return
     }
 
@@ -147,30 +201,36 @@ function waitForSeeder(torrent, job) {
     job.status = 'descargando'
     job.message = completeCount
       ? `Omitiendo ${completeCount} archivo${completeCount === 1 ? '' : 's'} ya completo${completeCount === 1 ? '' : 's'}. Descargando solo lo que falta.`
-      : 'Seeder encontrado. Descargando.'
+      : 'Pares con piezas disponibles. Descargando.'
     missingFiles.forEach((file) => file.select())
     torrent.resume()
+    scheduleStateSave()
   }
 
   const beginDownload = () => {
-    if (started || seederFound || job.status === 'sin-seeders') return
-    const hasSeeder = torrent.wires.some((wire) => wireHasEveryPiece(wire, torrent.pieces.length))
-    if (!hasSeeder) return
-    seederFound = true
+    if (started || sourceFound || torrent.destroyed) return
+    const hasUsefulSource = torrent.wires.some((wire) => wireHasUsefulPiece(torrent, wire))
+    if (!hasUsefulSource) return
+    sourceFound = true
     clearTimeout(job.timer)
     job.status = 'verificando'
-    job.message = 'Seeder encontrado. Verificando qué archivos ya están completos…'
+    job.message = 'Hay piezas disponibles. Terminando la verificación local…'
     if (torrent.ready) selectMissingFiles()
-    else torrent.once('ready', selectMissingFiles)
   }
 
   torrent.on('ready', () => {
-    if (started || !torrent.files.length || !torrent.files.every((file) => file.done)) return
-    started = true
-    clearTimeout(job.timer)
-    job.existingOnly = true
-    job.status = 'completo'
-    job.message = 'Todos los archivos ya existían completos. No se descargó nada.'
+    if (started || !torrent.files.length) return
+    if (torrent.files.every((file) => file.done)) {
+      started = true
+      clearTimeout(job.timer)
+      job.existingOnly = true
+      job.status = 'completo'
+      job.message = 'Todos los archivos ya existían completos. No se descargó nada.'
+      captureFileModtimes(job).then(() => scheduleStateSave())
+      return
+    }
+    beginDownload()
+    if (job.restorePaused || sourceFound) selectMissingFiles()
   })
 
   const watchWire = (wire) => {
@@ -186,59 +246,84 @@ function waitForSeeder(torrent, job) {
 
   job.timer = setTimeout(() => {
     if (started) return
-    job.status = 'sin-seeders'
-    job.message = 'No se encontró ningún seeder completo. No se descargó.'
-    torrent.destroy()
+    job.status = 'esperando'
+    job.message = 'Aún no hay pares con piezas útiles. La búsqueda continúa sin descargar.'
+    scheduleStateSave()
   }, SEEDER_TIMEOUT_MS)
 }
 
-function addMagnet(magnet) {
+function addMagnet(magnet, resumeState = {}) {
   // Descubre pares y metadatos, pero no solicita piezas todavía.
-  const torrent = client.add(magnet, { path: DOWNLOAD_DIR, deselect: true })
+  const options = { path: DOWNLOAD_DIR, deselect: true }
+  if (resumeState.bitfield) options.bitfield = Buffer.from(resumeState.bitfield, 'base64')
+  if (resumeState.complete && Array.isArray(resumeState.fileModtimes)) options.fileModtimes = resumeState.fileModtimes
+  if (Array.isArray(resumeState.announce)) options.announce = resumeState.announce
+  const torrentSource = resumeState.torrentFile
+    ? Buffer.from(resumeState.torrentFile, 'base64')
+    : magnet
+  const torrent = client.add(torrentSource, options)
   const job = {
     torrent,
+    magnet,
     status: 'buscando',
-    message: 'Buscando metadatos y seeders…',
+    message: resumeState.torrentFile ? 'Restaurando torrent desde la caché…' : 'Buscando metadatos y pares…',
     timer: null,
     streams: new Set(),
     preexistingComplete: new Set(),
-    existingOnly: false
+    existingOnly: false,
+    restorePaused: Boolean(resumeState.paused),
+    cachedBitfield: resumeState.bitfield || null,
+    cachedTorrentFile: resumeState.torrentFile || null,
+    cachedAnnounce: resumeState.announce || [],
+    fileModtimes: resumeState.fileModtimes || null
   }
-  const registerJob = () => jobs.set(torrent.infoHash, job)
+  const registerJob = () => {
+    jobs.set(torrent.infoHash, job)
+    scheduleStateSave()
+  }
   if (torrent.infoHash) registerJob()
   else torrent.once('_infoHash', registerJob)
 
   job.timer = setTimeout(() => {
-    job.status = 'sin-seeders'
-    job.message = 'No se pudieron obtener metadatos ni confirmar un seeder. No se descargó.'
-    torrent.destroy()
+    job.status = 'esperando'
+    job.message = 'Aún no se obtienen metadatos. La búsqueda de pares continúa.'
+    scheduleStateSave()
   }, SEEDER_TIMEOUT_MS)
 
   torrent.on('metadata', () => {
     clearTimeout(job.timer)
+    job.cachedTorrentFile = encodeBytes(torrent.torrentFile)
+    job.cachedAnnounce = torrent.announce || []
     job.status = 'verificando'
-    job.message = 'Verificando archivos existentes y buscando un seeder completo…'
-    waitForSeeder(torrent, job)
+    job.message = resumeState.bitfield
+      ? 'Usando la caché para comprobar rápidamente los archivos…'
+      : 'Verificando archivos existentes y buscando piezas disponibles…'
+    waitForSources(torrent, job)
+    scheduleStateSave()
   })
 
   torrent.on('ready', () => {
     job.preexistingComplete = new Set(
       torrent.files.filter((file) => file.done).map((file) => file.path)
     )
+    scheduleStateSave()
   })
 
-  torrent.on('done', () => {
+  torrent.on('done', async () => {
     clearTimeout(job.timer)
     job.status = 'completo'
     job.message = job.existingOnly
       ? 'Todos los archivos ya existían completos. No se descargó nada.'
       : 'Descarga completa.'
+    await captureFileModtimes(job)
+    scheduleStateSave()
   })
 
   torrent.on('error', (error) => {
     clearTimeout(job.timer)
     job.status = 'error'
     job.message = error.message || 'La descarga falló.'
+    scheduleStateSave()
   })
 
   return torrent
@@ -303,12 +388,12 @@ app.post('/api/torrents', requireAuth, async (req, res) => {
   if (!isMagnet(magnet)) return res.status(400).json({ error: 'Pega un enlace magnet válido.' })
 
   const existing = await client.get(magnet)
-  if (existing) return res.status(409).json({ error: 'Ese torrent ya está en la lista.' })
+  if (existing) return res.status(409).json({ error: 'Ese torrent ya está activo o fue restaurado desde la caché.' })
 
   try {
     const torrent = addMagnet(magnet)
     const id = await waitForInfoHash(torrent)
-    res.status(202).json({ id, message: 'Magnet agregado. Buscando seeders…' })
+    res.status(202).json({ id, message: 'Magnet agregado. Buscando pares con piezas disponibles…' })
   } catch (error) {
     res.status(400).json({ error: error.message || 'No se pudo agregar el magnet.' })
   }
@@ -323,8 +408,10 @@ app.post('/api/torrents/:id/pause', requireAuth, (req, res) => {
   job.streams.clear()
   job.torrent.files.forEach((file) => file.deselect())
   job.torrent.pause()
+  job.restorePaused = true
   job.status = 'pausado'
   job.message = 'Descarga pausada.'
+  scheduleStateSave()
   res.json({ ok: true })
 })
 
@@ -335,8 +422,10 @@ app.post('/api/torrents/:id/resume', requireAuth, (req, res) => {
 
   job.torrent.files.filter((file) => !file.done).forEach((file) => file.select())
   job.torrent.resume()
+  job.restorePaused = false
   job.status = 'descargando'
   job.message = 'Descarga reanudada.'
+  scheduleStateSave()
   res.json({ ok: true })
 })
 
@@ -359,6 +448,7 @@ app.delete('/api/torrents/:id', requireAuth, async (req, res) => {
     await new Promise((resolve) => job.torrent.destroy({ destroyStore: false }, resolve))
   }
   await Promise.all(removableFiles.map((file) => fs.promises.unlink(file).catch(() => {})))
+  scheduleStateSave(0)
   res.status(204).end()
 })
 
@@ -425,6 +515,28 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Ocurrió un error inesperado.' })
 })
 
+async function restorePersistedJobs() {
+  let saved
+  try {
+    saved = JSON.parse(await fs.promises.readFile(STATE_FILE, 'utf8'))
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('No se pudo leer el estado guardado:', error.message)
+    return
+  }
+
+  for (const record of saved.torrents || []) {
+    if (!record?.magnet || !isMagnet(record.magnet)) continue
+    try {
+      const torrent = addMagnet(record.magnet, record)
+      await waitForInfoHash(torrent)
+    } catch (error) {
+      console.error('No se pudo restaurar un torrent:', error.message)
+    }
+  }
+}
+
+await restorePersistedJobs()
+
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Magnet Box disponible en http://0.0.0.0:${PORT}`)
   console.log(`Descargas: ${DOWNLOAD_DIR}`)
@@ -432,6 +544,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 async function shutdown() {
   server.close()
+  clearInterval(stateCheckpoint)
+  clearTimeout(stateSaveTimer)
+  await saveStateNow()
   await new Promise((resolve) => client.destroy(resolve))
   process.exit(0)
 }
