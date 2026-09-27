@@ -18,6 +18,7 @@ const SESSION_SECRET = 'cambia-tambien-esta-frase-larga-y-privada'
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000
 const SEEDER_TIMEOUT_MS = 90_000
+const STREAM_CHUNK_BYTES = 8 * 1024 * 1024
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.ogv'])
 const MIME_TYPES = {
   '.mp4': 'video/mp4',
@@ -157,6 +158,8 @@ function formatTorrent(torrent, job) {
       name: file.name,
       length: file.length,
       video: canStream && isVideo(file.name),
+      complete: file.done,
+      progress: Number.isFinite(file.progress) ? file.progress : 0,
       streamUrl: `/api/torrents/${torrent.infoHash}/files/${index}/stream`
     }))
   }
@@ -349,17 +352,74 @@ function waitForInfoHash(torrent) {
   })
 }
 
-async function listVideos(directory = DOWNLOAD_DIR, base = DOWNLOAD_DIR) {
+function incompleteTorrentPaths() {
+  const paths = new Set()
+  for (const job of jobs.values()) {
+    for (const file of job.torrent.files || []) {
+      if (!file.done) paths.add(file.path.split(path.sep).join('/'))
+    }
+  }
+  return paths
+}
+
+async function listVideos(directory = DOWNLOAD_DIR, base = DOWNLOAD_DIR, incomplete = incompleteTorrentPaths()) {
   const entries = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => [])
   const nested = await Promise.all(entries.map(async (entry) => {
     const absolute = path.join(directory, entry.name)
-    if (entry.isDirectory()) return listVideos(absolute, base)
+    if (entry.isDirectory()) return listVideos(absolute, base, incomplete)
     if (!entry.isFile() || !isVideo(entry.name)) return []
     const stat = await fs.promises.stat(absolute)
     const relative = path.relative(base, absolute).split(path.sep).join('/')
-    return [{ name: entry.name, path: relative, length: stat.size, streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
+    if (incomplete.has(relative)) return []
+    return [{ name: entry.name, path: relative, length: stat.size, complete: true, progress: 1, streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
   }))
   return nested.flat()
+}
+
+function parseRange(range, length, chunkOpenEnded = false) {
+  if (!range) return { start: 0, end: length - 1, partial: false }
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
+  if (!match || (!match[1] && !match[2])) return null
+
+  let start
+  let end
+  if (!match[1]) {
+    const suffixLength = Number(match[2])
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return null
+    start = Math.max(length - suffixLength, 0)
+    end = length - 1
+  } else {
+    start = Number(match[1])
+    end = match[2] ? Number(match[2]) : length - 1
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return null
+    if (!match[2] && chunkOpenEnded) end = Math.min(start + STREAM_CHUNK_BYTES - 1, length - 1)
+    else end = Math.min(end, length - 1)
+  }
+  if (start < 0 || start > end || start >= length) return null
+  return { start, end, partial: true }
+}
+
+function pipeTorrentStream(req, res, file, job, range) {
+  const stream = file.createReadStream({ start: range.start, end: range.end })
+  job.streams.add(stream)
+
+  const stop = () => {
+    if (!stream.destroyed) stream.destroy()
+  }
+  const cleanup = () => {
+    job.streams.delete(stream)
+    req.off('aborted', stop)
+    res.off('close', stop)
+  }
+  req.once('aborted', stop)
+  res.once('close', stop)
+  stream.once('close', cleanup)
+  stream.once('end', cleanup)
+  stream.on('error', () => {
+    cleanup()
+    if (!res.destroyed) res.destroy()
+  })
+  stream.pipe(res)
 }
 
 app.post('/api/login', (req, res) => {
@@ -473,28 +533,27 @@ app.get('/api/torrents/:id/files/:index/stream', requireAuth, async (req, res) =
   const extension = path.extname(file.name).toLowerCase()
   res.setHeader('Content-Type', MIME_TYPES[extension] || 'application/octet-stream')
   res.setHeader('Accept-Ranges', 'bytes')
+  res.setHeader('Cache-Control', job.status === 'completo' ? 'private, max-age=3600' : 'private, no-store')
 
-  if (!range) {
-    res.setHeader('Content-Length', file.length)
-    const stream = file.createReadStream()
-    job.streams.add(stream)
-    stream.once('close', () => job.streams.delete(stream))
-    return stream.on('error', () => res.destroy()).pipe(res)
+  if (file.done) {
+    const absolute = path.resolve(DOWNLOAD_DIR, file.path)
+    if (!absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`)) return res.status(404).end()
+    return res.sendFile(absolute, (error) => {
+      if (error && !res.headersSent) res.status(error.statusCode || 404).end()
+    })
   }
 
-  const match = /^bytes=(\d*)-(\d*)$/.exec(range)
-  if (!match) return res.status(416).end()
-  const start = match[1] ? Number(match[1]) : 0
-  const end = match[2] ? Math.min(Number(match[2]), file.length - 1) : file.length - 1
-  if (start > end || start >= file.length) return res.status(416).set('Content-Range', `bytes */${file.length}`).end()
-
-  res.status(206)
-  res.setHeader('Content-Range', `bytes ${start}-${end}/${file.length}`)
-  res.setHeader('Content-Length', end - start + 1)
-  const stream = file.createReadStream({ start, end })
-  job.streams.add(stream)
-  stream.once('close', () => job.streams.delete(stream))
-  stream.on('error', () => res.destroy()).pipe(res)
+  const parsedRange = parseRange(range, file.length, !file.done)
+  if (!parsedRange) {
+    return res.status(416).set('Content-Range', `bytes */${file.length}`).end()
+  }
+  if (parsedRange.partial) {
+    res.status(206)
+    res.setHeader('Content-Range', `bytes ${parsedRange.start}-${parsedRange.end}/${file.length}`)
+  }
+  res.setHeader('Content-Length', parsedRange.end - parsedRange.start + 1)
+  if (req.method === 'HEAD') return res.end()
+  pipeTorrentStream(req, res, file, job, parsedRange)
 })
 
 app.get('/media', requireAuth, async (req, res) => {
@@ -502,6 +561,7 @@ app.get('/media', requireAuth, async (req, res) => {
   const absolute = path.resolve(DOWNLOAD_DIR, relative)
   const insideDownloadDir = absolute === DOWNLOAD_DIR || absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`)
   if (!insideDownloadDir || !isVideo(absolute)) return res.status(404).end()
+  res.setHeader('Cache-Control', 'private, max-age=3600')
   res.sendFile(absolute, (error) => {
     if (error && !res.headersSent) res.status(error.statusCode || 404).end()
   })

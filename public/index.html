@@ -43,11 +43,15 @@
     .media-card { position:relative; width:100%; min-width:0; aspect-ratio:16/9; padding:0; overflow:hidden; border:1px solid #33413f; border-radius:12px; background:linear-gradient(145deg,#1d2c29,#0b1015 68%); color:var(--text); text-align:left; isolation:isolate; touch-action:manipulation; }
     .media-card::before { content:'▶'; position:absolute; inset:0; z-index:-1; display:grid; place-items:center; color:rgba(103,232,182,.55); font-size:1.6rem; }
     .media-card:hover,.media-card:focus-visible,.media-card.previewing { border-color:#5ba98b; box-shadow:0 0 0 3px rgba(103,232,182,.1); }
-    .media-thumb { position:absolute; inset:0; width:100%; height:100%; max-height:none; object-fit:cover; background:transparent; transition:transform .28s ease,filter .28s ease; pointer-events:none; }
+    .media-thumb { position:absolute; inset:0; width:100%; height:100%; max-height:none; object-fit:cover; background:transparent; opacity:0; transition:opacity .2s ease,transform .28s ease,filter .28s ease; pointer-events:none; }
+    .media-card.thumb-ready .media-thumb,.media-card.previewing .media-thumb { opacity:1; }
     .media-card:hover .media-thumb,.media-card.previewing .media-thumb { transform:scale(1.035); }
     .media-shade { position:absolute; inset:0; display:flex; align-items:flex-end; padding:34px 10px 9px; background:linear-gradient(180deg,transparent 28%,rgba(3,6,8,.9)); pointer-events:none; }
     .media-name { width:100%; overflow:hidden; color:#fff; font-size:.82rem; font-weight:750; line-height:1.25; text-overflow:ellipsis; white-space:nowrap; }
     .media-play { position:absolute; top:9px; left:9px; display:grid; place-items:center; width:31px; height:31px; border-radius:999px; background:rgba(5,10,12,.74); color:var(--accent); font-size:.8rem; backdrop-filter:blur(6px); pointer-events:none; }
+    .media-card.loading .media-play { animation:pulse 1s ease-in-out infinite alternate; }
+    .media-file-progress { position:absolute; z-index:3; left:0; right:0; bottom:0; height:3px; background:#27313b; pointer-events:none; }
+    .media-file-progress>span { display:block; height:100%; background:var(--accent); }
     .gallery-more { grid-column:1/-1; width:100%; border:1px dashed #3a4856; background:#121922; color:#cbd4df; padding:10px 13px; border-radius:10px; font-weight:700; }
     .gallery-more:hover { border-color:#607082; color:#fff; }
     .torrent-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:15px; padding-top:14px; border-top:1px solid var(--line); }
@@ -68,8 +72,10 @@
     .message { min-height:24px; color:var(--danger); font-size:.88rem; margin:10px 0 0; }
     dialog { width:min(900px,calc(100% - 24px)); border:1px solid var(--line); border-radius:16px; padding:0; background:#050709; color:var(--text); box-shadow:0 30px 100px #000; }
     dialog::backdrop { background:rgba(0,0,0,.8); backdrop-filter:blur(5px); }
-    .player-head { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 15px; }
+    .player-head { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:4px 12px; padding:12px 15px; }
+    .player-state { grid-column:1; color:var(--muted); font-size:.78rem; min-height:1.2em; }
     #player { width:100%; max-height:76vh; display:block; background:#000; }
+    @keyframes pulse { to { opacity:.45; transform:scale(.88); } }
     @media (max-width:640px) {
       .shell{width:calc(100% - 20px);padding:16px 0 44px}
       header{margin-bottom:24px}
@@ -133,8 +139,8 @@
   </main>
 
   <dialog id="playerDialog">
-    <div class="player-head"><strong id="playerTitle">Video</strong><button class="ghost" id="closePlayer">Cerrar</button></div>
-    <video id="player" controls playsinline></video>
+    <div class="player-head"><strong id="playerTitle">Video</strong><button class="ghost" id="closePlayer">Cerrar</button><span class="player-state" id="playerState"></span></div>
+    <video id="player" controls playsinline preload="metadata"></video>
   </dialog>
 
   <script>
@@ -151,7 +157,23 @@
     let lastLibraryItems = []
     let suppressPreviewClickUntil = 0
     let pressedPreviewCard = null
+    let activePreviewCard = null
+    const thumbnailQueue = []
+    const queuedThumbnails = new WeakSet()
+    let thumbnailsLoading = 0
     let refreshTimer
+    let lastLibraryRefresh = 0
+    let refreshInFlight = null
+
+    const thumbnailObserver = 'IntersectionObserver' in window
+      ? new IntersectionObserver((entries) => {
+          entries.forEach((entry) => {
+            if (!entry.isIntersecting) return
+            thumbnailObserver.unobserve(entry.target)
+            queueThumbnail(entry.target)
+          })
+        }, { rootMargin:'160px' })
+      : null
 
     async function api(url, options = {}) {
       const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } })
@@ -176,6 +198,7 @@
       clearInterval(refreshTimer)
       appView.classList.add('hidden')
       loginView.classList.remove('hidden')
+      stopPreview(activePreviewCard)
       player.pause()
       playerDialog.close?.()
     }
@@ -183,14 +206,17 @@
     function showApp() {
       loginView.classList.add('hidden')
       appView.classList.remove('hidden')
-      refresh()
+      refresh(true)
       clearInterval(refreshTimer)
       refreshTimer = setInterval(refresh, 2000)
     }
 
     function openPlayer(name, url) {
+      stopPreview(activePreviewCard)
       $('#playerTitle').textContent = name
+      $('#playerState').textContent = 'Preparando video…'
       player.src = url
+      player.load()
       playerDialog.showModal()
       player.play().catch(() => {})
     }
@@ -198,23 +224,145 @@
     function mediaCard(item) {
       const name = escapeHtml(item.name)
       const url = escapeHtml(item.streamUrl)
-      return `<button class="media-card" data-name="${name}" data-url="${url}" aria-label="Reproducir ${name}"><video class="media-thumb" muted playsinline preload="metadata" src="${url}#t=0.4"></video><span class="media-play">▶</span><span class="media-shade"><span class="media-name">${name}</span></span></button>`
+      const fileIndex = Number.isInteger(item.index) ? ` data-file-index="${item.index}"` : ''
+      const complete = Boolean(item.complete)
+      const progress = Math.max(0,Math.min(100,Math.round((item.progress || 0) * 100)))
+      const fileProgress = complete ? '' : `<span class="media-file-progress" title="${progress}% descargado"><span style="width:${progress}%"></span></span>`
+      return `<button class="media-card"${fileIndex} data-name="${name}" data-url="${url}" data-complete="${complete}" aria-label="Reproducir ${name}"><video class="media-thumb" muted playsinline preload="none" data-src="${url}"></video><span class="media-play">▶</span><span class="media-shade"><span class="media-name">${name}</span></span>${fileProgress}</button>`
+    }
+
+    function ensureVideoSource(video, preload = 'metadata') {
+      if (video.getAttribute('src')) return
+      video.preload = preload
+      video.src = video.dataset.src
+      video.load()
+    }
+
+    function queueThumbnail(card) {
+      if (!card?.isConnected || card.dataset.complete !== 'true' || queuedThumbnails.has(card)) return
+      queuedThumbnails.add(card)
+      thumbnailQueue.push(card)
+      pumpThumbnails()
+    }
+
+    function pumpThumbnails() {
+      while (thumbnailsLoading < 2 && thumbnailQueue.length) {
+        const card = thumbnailQueue.shift()
+        if (!card?.isConnected) continue
+        thumbnailsLoading += 1
+        loadThumbnail(card).finally(() => {
+          thumbnailsLoading -= 1
+          pumpThumbnails()
+        })
+      }
+    }
+
+    function loadThumbnail(card) {
+      return new Promise((resolve) => {
+        const video = card.querySelector('.media-thumb')
+        if (!video || card.classList.contains('thumb-ready')) return resolve()
+        let finished = false
+        const finish = (success) => {
+          if (finished) return
+          finished = true
+          clearTimeout(timeout)
+          video.removeEventListener('loadedmetadata', seek)
+          video.removeEventListener('seeked', ready)
+          video.removeEventListener('error', failed)
+          card.classList.remove('loading')
+          if (success) card.classList.add('thumb-ready')
+          resolve()
+        }
+        const ready = () => {
+          let captured = false
+          try {
+            if (video.videoWidth && video.videoHeight) {
+              const canvas = document.createElement('canvas')
+              canvas.width = 360
+              canvas.height = Math.max(1,Math.round(360 * video.videoHeight / video.videoWidth))
+              canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height)
+              video.poster = canvas.toDataURL('image/jpeg',.72)
+              captured = true
+            }
+          } catch {}
+          video.pause()
+          video.removeAttribute('src')
+          video.load()
+          finish(captured)
+        }
+        const failed = () => finish(false)
+        const seek = () => {
+          const target = Number.isFinite(video.duration) && video.duration > 1
+            ? Math.min(5,Math.max(.4,video.duration * .04))
+            : .4
+          if (Math.abs(video.currentTime - target) < .05) return ready()
+          try { video.currentTime = target } catch { failed() }
+        }
+        const timeout = setTimeout(() => finish(false),8000)
+        card.classList.add('loading')
+        video.addEventListener('loadedmetadata',seek,{ once:true })
+        video.addEventListener('seeked',ready,{ once:true })
+        video.addEventListener('error',failed,{ once:true })
+        ensureVideoSource(video)
+        if (video.readyState >= 1) seek()
+      })
+    }
+
+    function activateMediaCards(root) {
+      root.querySelectorAll('.media-card[data-complete="true"]').forEach((card) => {
+        if (thumbnailObserver) thumbnailObserver.observe(card)
+      })
+    }
+
+    function disposeMedia(root) {
+      root.querySelectorAll('.media-card').forEach((card) => {
+        thumbnailObserver?.unobserve(card)
+        clearTimeout(card.previewTimer)
+        clearTimeout(card.releaseTimer)
+        const video = card.querySelector('.media-thumb')
+        if (!video) return
+        video.pause()
+        video.removeAttribute('src')
+        video.load()
+      })
+      if (activePreviewCard && root.contains(activePreviewCard)) activePreviewCard = null
     }
 
     function startPreview(card) {
       const video = card?.querySelector('.media-thumb')
       if (!video) return
+      if (activePreviewCard && activePreviewCard !== card) stopPreview(activePreviewCard)
+      activePreviewCard = card
+      card.previewWanted = true
       card.classList.add('previewing')
+      card.classList.add('loading')
       video.muted = true
-      video.play().catch(() => card.classList.remove('previewing'))
+      ensureVideoSource(video,'auto')
+      const play = () => {
+        if (!card.previewWanted) return
+        card.classList.remove('loading')
+        video.play().catch(() => card.classList.remove('previewing'))
+      }
+      if (video.readyState >= 2) play()
+      else video.addEventListener('canplay',play,{ once:true })
     }
 
     function stopPreview(card) {
       const video = card?.querySelector('.media-thumb')
       if (!video) return
       clearTimeout(card.previewTimer)
+      clearTimeout(card.releaseTimer)
+      card.previewWanted = false
       video.pause()
-      card.classList.remove('previewing')
+      card.classList.remove('previewing','loading')
+      const release = () => {
+        if (card.previewWanted) return
+        video.removeAttribute('src')
+        video.load()
+      }
+      if (card.dataset.complete === 'true') card.releaseTimer = setTimeout(release,10000)
+      else release()
+      if (activePreviewCard === card) activePreviewCard = null
     }
 
     function renderTorrents(items) {
@@ -229,11 +377,23 @@
           card.querySelector('.js-progress').style.width = `${Math.round(item.progress * 100)}%`
           card.querySelector('.js-stats').textContent = `${Math.round(item.progress * 100)}% · ${humanBytes(item.downloaded)} de ${humanBytes(item.length)} · ${humanBytes(item.speed)}/s`
           card.querySelector('.js-peers').textContent = `${item.peers} pares`
+          item.files.forEach((file) => {
+            const media = card.querySelector(`[data-file-index="${file.index}"]`)
+            const progressBar = media?.querySelector('.media-file-progress>span')
+            if (progressBar) progressBar.style.width = `${Math.round(file.progress * 100)}%`
+            if (file.complete && media?.dataset.complete === 'false') {
+              media.dataset.complete = 'true'
+              media.querySelector('.media-file-progress')?.remove()
+              if (thumbnailObserver) thumbnailObserver.observe(media)
+            }
+          })
         })
         return
       }
       torrentStructureKey = nextStructureKey
-      $('#downloads').innerHTML = items.length ? items.map((item) => {
+      const downloads = $('#downloads')
+      disposeMedia(downloads)
+      downloads.innerHTML = items.length ? items.map((item) => {
         const percent = Math.round(item.progress * 100)
         const bad = ['sin-seeders','error'].includes(item.status)
         const paused = item.status === 'pausado'
@@ -249,6 +409,7 @@
         const actions = pauseButton || resumeButton || cancelButton ? `<div class="torrent-actions">${pauseButton}${resumeButton}${cancelButton}</div>` : ''
         return `<article class="card torrent-card" id="torrent-${item.id}"><div class="card-top"><div><div class="title">${escapeHtml(item.name)}</div><div class="meta">${escapeHtml(item.message)} · <span class="js-peers">${item.peers} pares</span></div></div><span class="status ${bad ? 'bad' : ''} ${paused ? 'paused' : ''}">${escapeHtml(item.status)}</span></div><div class="progress"><div class="js-progress" style="width:${percent}%"></div></div><div class="meta js-stats">${percent}% · ${humanBytes(item.downloaded)} de ${humanBytes(item.length)} · ${humanBytes(item.speed)}/s</div>${files}${actions}</article>`
       }).join('') : '<div class="empty">Aún no hay descargas. Pega tu primer magnet arriba.</div>'
+      activateMediaCards(downloads)
     }
 
     function renderLibrary(items) {
@@ -257,23 +418,37 @@
       const nextStructureKey = JSON.stringify([libraryLimit,items.map((item) => [item.path,item.length])])
       if (nextStructureKey === libraryStructureKey) return
       libraryStructureKey = nextStructureKey
+      const library = $('#library')
+      disposeMedia(library)
       if (!items.length) {
-        $('#library').innerHTML = '<div class="empty">Los videos descargados aparecerán aquí.</div>'
+        library.innerHTML = '<div class="empty">Los videos descargados aparecerán aquí.</div>'
         return
       }
       const visible = items.slice(0,libraryLimit).map(mediaCard).join('')
       const more = items.length > libraryLimit ? `<button class="gallery-more" data-library-more>Mostrar ${Math.min(18,items.length-libraryLimit)} más</button>` : ''
-      $('#library').innerHTML = visible + more
+      library.innerHTML = visible + more
+      activateMediaCards(library)
     }
 
-    async function refresh() {
-      try {
-        const [torrents, videos] = await Promise.all([api('/api/torrents'), api('/api/library')])
-        renderTorrents(torrents)
-        renderLibrary(videos)
-      } catch (error) {
-        if (!appView.classList.contains('hidden')) $('#addMessage').textContent = error.message
-      }
+    function refresh(forceLibrary = false) {
+      if (refreshInFlight) return refreshInFlight
+      refreshInFlight = (async () => {
+        try {
+          const updateLibrary = forceLibrary || Date.now() - lastLibraryRefresh > 15000
+          const [torrents, videos] = await Promise.all([
+            api('/api/torrents'),
+            updateLibrary ? api('/api/library') : Promise.resolve(null)
+          ])
+          renderTorrents(torrents)
+          if (videos) {
+            lastLibraryRefresh = Date.now()
+            renderLibrary(videos)
+          }
+        } catch (error) {
+          if (!appView.classList.contains('hidden')) $('#addMessage').textContent = error.message
+        }
+      })().finally(() => { refreshInFlight = null })
+      return refreshInFlight
     }
 
     $('#loginForm').addEventListener('submit', async (event) => {
@@ -335,7 +510,7 @@
         const method = action === 'cancel' ? 'DELETE' : 'POST'
         const suffix = action === 'cancel' ? '' : `/${action}`
         await api(`/api/torrents/${id}${suffix}`, { method })
-        await refresh()
+        await refresh(action === 'cancel')
       } catch (error) {
         $('#addMessage').textContent = error.message
         control.disabled = false
@@ -378,8 +553,16 @@
     document.addEventListener('contextmenu', (event) => {
       if (event.target.closest('.media-card')) event.preventDefault()
     })
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) stopPreview(activePreviewCard)
+    })
+    player.addEventListener('loadstart', () => { $('#playerState').textContent = 'Preparando video…' })
+    player.addEventListener('waiting', () => { $('#playerState').textContent = 'Cargando las siguientes piezas…' })
+    player.addEventListener('canplay', () => { $('#playerState').textContent = '' })
+    player.addEventListener('playing', () => { $('#playerState').textContent = '' })
+    player.addEventListener('error', () => { $('#playerState').textContent = 'Este formato o códec no puede reproducirse en este navegador.' })
     $('#closePlayer').addEventListener('click', () => playerDialog.close())
-    playerDialog.addEventListener('close', () => { player.pause(); player.removeAttribute('src'); player.load() })
+    playerDialog.addEventListener('close', () => { player.pause(); player.removeAttribute('src'); player.load(); $('#playerState').textContent = '' })
     $('#logoutButton').addEventListener('click', async () => { await api('/api/logout', { method:'POST' }).catch(() => {}); showLogin() })
 
     api('/api/session').then((session) => session.authenticated ? showApp() : showLogin()).catch(showLogin)
