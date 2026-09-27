@@ -164,7 +164,8 @@ function addMagnet(magnet) {
     torrent,
     status: 'buscando',
     message: 'Buscando metadatos y seeders…',
-    timer: null
+    timer: null,
+    streams: new Set()
   }
   const registerJob = () => jobs.set(torrent.infoHash, job)
   if (torrent.infoHash) registerJob()
@@ -268,6 +269,48 @@ app.post('/api/torrents', requireAuth, async (req, res) => {
   }
 })
 
+app.post('/api/torrents/:id/pause', requireAuth, (req, res) => {
+  const job = jobs.get(req.params.id)
+  if (!job) return res.status(404).json({ error: 'Descarga no encontrada.' })
+  if (job.status !== 'descargando') return res.status(409).json({ error: 'Esta descarga no se puede pausar ahora.' })
+
+  job.streams.forEach((stream) => stream.destroy())
+  job.streams.clear()
+  job.torrent.files.forEach((file) => file.deselect())
+  job.torrent.pause()
+  job.status = 'pausado'
+  job.message = 'Descarga pausada.'
+  res.json({ ok: true })
+})
+
+app.post('/api/torrents/:id/resume', requireAuth, (req, res) => {
+  const job = jobs.get(req.params.id)
+  if (!job) return res.status(404).json({ error: 'Descarga no encontrada.' })
+  if (job.status !== 'pausado') return res.status(409).json({ error: 'Esta descarga no está pausada.' })
+
+  job.torrent.files.forEach((file) => file.select())
+  job.torrent.resume()
+  job.status = 'descargando'
+  job.message = 'Descarga reanudada.'
+  res.json({ ok: true })
+})
+
+app.delete('/api/torrents/:id', requireAuth, async (req, res) => {
+  const job = jobs.get(req.params.id)
+  if (!job) return res.status(404).json({ error: 'Descarga no encontrada.' })
+  if (job.status === 'completo') return res.status(409).json({ error: 'La descarga ya está completa.' })
+
+  clearTimeout(job.timer)
+  job.streams.forEach((stream) => stream.destroy())
+  job.streams.clear()
+  jobs.delete(req.params.id)
+
+  if (!job.torrent.destroyed) {
+    await new Promise((resolve) => job.torrent.destroy({ destroyStore: true }, resolve))
+  }
+  res.status(204).end()
+})
+
 app.get('/api/library', requireAuth, async (req, res, next) => {
   try {
     res.json(await listVideos())
@@ -292,7 +335,10 @@ app.get('/api/torrents/:id/files/:index/stream', requireAuth, async (req, res) =
 
   if (!range) {
     res.setHeader('Content-Length', file.length)
-    return file.createReadStream().on('error', () => res.destroy()).pipe(res)
+    const stream = file.createReadStream()
+    job.streams.add(stream)
+    stream.once('close', () => job.streams.delete(stream))
+    return stream.on('error', () => res.destroy()).pipe(res)
   }
 
   const match = /^bytes=(\d*)-(\d*)$/.exec(range)
@@ -304,7 +350,10 @@ app.get('/api/torrents/:id/files/:index/stream', requireAuth, async (req, res) =
   res.status(206)
   res.setHeader('Content-Range', `bytes ${start}-${end}/${file.length}`)
   res.setHeader('Content-Length', end - start + 1)
-  file.createReadStream({ start, end }).on('error', () => res.destroy()).pipe(res)
+  const stream = file.createReadStream({ start, end })
+  job.streams.add(stream)
+  stream.once('close', () => job.streams.delete(stream))
+  stream.on('error', () => res.destroy()).pipe(res)
 })
 
 app.get('/media', requireAuth, async (req, res) => {

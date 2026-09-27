@@ -2,6 +2,8 @@
 
 App privada y mínima para pegar enlaces magnet, comprobar que exista al menos un seeder completo, descargar a disco y reproducir videos desde el navegador.
 
+Cada descarga activa puede pausarse y reanudarse. Al cancelar, el torrent se detiene, se quita de la lista y se eliminan sus archivos parciales.
+
 ## Antes de ejecutarla
 
 Abre `server.js` y cambia estas constantes:

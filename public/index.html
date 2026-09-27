@@ -34,11 +34,16 @@
     .title { font-weight:750; word-break:break-word; }
     .status { flex:0 0 auto; color:var(--accent); font-size:.78rem; text-transform:uppercase; letter-spacing:.09em; font-weight:800; }
     .status.bad { color:var(--danger); }
+    .status.paused { color:#f7c76a; }
     .meta { color:var(--muted); font-size:.86rem; margin-top:6px; }
     .progress { height:6px; background:#222a34; border-radius:999px; overflow:hidden; margin:16px 0 9px; }
     .progress > div { height:100%; width:0; background:var(--accent); transition:width .35s ease; }
     .files { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
     .play { border:1px solid #36594d; background:#12251f; color:#c4ffe9; padding:8px 11px; border-radius:9px; }
+    .torrent-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:15px; padding-top:14px; border-top:1px solid var(--line); }
+    .control { border:1px solid #3b4654; background:#1a222c; color:var(--text); padding:8px 13px; border-radius:9px; font-weight:700; }
+    .control:hover { border-color:#647286; }
+    .control.danger { color:#ffb4bc; border-color:#633943; background:#28161b; }
     .library { margin-top:42px; }
     .empty { padding:32px 18px; border:1px dashed var(--line); border-radius:15px; text-align:center; color:var(--muted); }
     .library-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:12px; }
@@ -163,8 +168,13 @@
       $('#downloads').innerHTML = items.length ? items.map((item) => {
         const percent = Math.round(item.progress * 100)
         const bad = ['sin-seeders','error'].includes(item.status)
+        const paused = item.status === 'pausado'
         const files = item.files.filter((file) => file.video).map((file) => `<button class="play" data-name="${escapeHtml(file.name)}" data-url="${file.streamUrl}">▶ ${escapeHtml(file.name)}</button>`).join('')
-        return `<article class="card"><div class="card-top"><div><div class="title">${escapeHtml(item.name)}</div><div class="meta">${escapeHtml(item.message)} · ${item.peers} pares</div></div><span class="status ${bad ? 'bad' : ''}">${escapeHtml(item.status)}</span></div><div class="progress"><div style="width:${percent}%"></div></div><div class="meta">${percent}% · ${humanBytes(item.downloaded)} de ${humanBytes(item.length)} · ${humanBytes(item.speed)}/s</div>${files ? `<div class="files">${files}</div>` : ''}</article>`
+        const pauseButton = item.status === 'descargando' ? `<button class="control" data-action="pause" data-id="${item.id}">Ⅱ Pausar</button>` : ''
+        const resumeButton = paused ? `<button class="control" data-action="resume" data-id="${item.id}">▶ Reanudar</button>` : ''
+        const cancelButton = item.status !== 'completo' ? `<button class="control danger" data-action="cancel" data-id="${item.id}">Cancelar</button>` : ''
+        const actions = pauseButton || resumeButton || cancelButton ? `<div class="torrent-actions">${pauseButton}${resumeButton}${cancelButton}</div>` : ''
+        return `<article class="card"><div class="card-top"><div><div class="title">${escapeHtml(item.name)}</div><div class="meta">${escapeHtml(item.message)} · ${item.peers} pares</div></div><span class="status ${bad ? 'bad' : ''} ${paused ? 'paused' : ''}">${escapeHtml(item.status)}</span></div><div class="progress"><div style="width:${percent}%"></div></div><div class="meta">${percent}% · ${humanBytes(item.downloaded)} de ${humanBytes(item.length)} · ${humanBytes(item.speed)}/s</div>${files ? `<div class="files">${files}</div>` : ''}${actions}</article>`
       }).join('') : '<div class="empty">Aún no hay descargas. Pega tu primer magnet arriba.</div>'
     }
 
@@ -206,9 +216,27 @@
       finally { button.disabled = false }
     })
 
-    document.addEventListener('click', (event) => {
+    document.addEventListener('click', async (event) => {
       const button = event.target.closest('[data-url]')
-      if (button) openPlayer(button.dataset.name, button.dataset.url)
+      if (button) return openPlayer(button.dataset.name, button.dataset.url)
+
+      const control = event.target.closest('[data-action]')
+      if (!control) return
+      const { action, id } = control.dataset
+      if (action === 'cancel' && !confirm('¿Cancelar esta descarga y eliminar sus archivos parciales?')) return
+
+      control.disabled = true
+      $('#addMessage').textContent = ''
+      try {
+        playerDialog.close?.()
+        const method = action === 'cancel' ? 'DELETE' : 'POST'
+        const suffix = action === 'cancel' ? '' : `/${action}`
+        await api(`/api/torrents/${id}${suffix}`, { method })
+        await refresh()
+      } catch (error) {
+        $('#addMessage').textContent = error.message
+        control.disabled = false
+      }
     })
     $('#closePlayer').addEventListener('click', () => playerDialog.close())
     playerDialog.addEventListener('close', () => { player.pause(); player.removeAttribute('src'); player.load() })
