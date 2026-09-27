@@ -127,17 +127,50 @@ function wireHasEveryPiece(wire, pieceCount) {
 
 function waitForSeeder(torrent, job) {
   let started = false
-  const beginDownload = () => {
-    if (started || job.status === 'sin-seeders') return
-    const hasSeeder = torrent.wires.some((wire) => wireHasEveryPiece(wire, torrent.pieces.length))
-    if (!hasSeeder) return
+  let seederFound = false
+
+  const selectMissingFiles = () => {
+    if (started || torrent.destroyed) return
+    const missingFiles = torrent.files.filter((file) => !file.done)
+    const completeCount = torrent.files.length - missingFiles.length
+
+    if (!missingFiles.length) {
+      started = true
+      job.existingOnly = true
+      job.status = 'completo'
+      job.message = 'Todos los archivos ya existían completos. No se descargó nada.'
+      return
+    }
+
     started = true
-    clearTimeout(job.timer)
     job.status = 'descargando'
-    job.message = 'Seeder encontrado. Descargando.'
-    torrent.files.forEach((file) => file.select())
+    job.message = completeCount
+      ? `Omitiendo ${completeCount} archivo${completeCount === 1 ? '' : 's'} ya completo${completeCount === 1 ? '' : 's'}. Descargando solo lo que falta.`
+      : 'Seeder encontrado. Descargando.'
+    missingFiles.forEach((file) => file.select())
     torrent.resume()
   }
+
+  const beginDownload = () => {
+    if (started || seederFound || job.status === 'sin-seeders') return
+    const hasSeeder = torrent.wires.some((wire) => wireHasEveryPiece(wire, torrent.pieces.length))
+    if (!hasSeeder) return
+    seederFound = true
+    clearTimeout(job.timer)
+    job.status = 'verificando'
+    job.message = 'Seeder encontrado. Verificando qué archivos ya están completos…'
+    if (torrent.ready) selectMissingFiles()
+    else torrent.once('ready', selectMissingFiles)
+  }
+
+  torrent.on('ready', () => {
+    if (started || !torrent.files.length || !torrent.files.every((file) => file.done)) return
+    started = true
+    clearTimeout(job.timer)
+    job.existingOnly = true
+    job.status = 'completo'
+    job.message = 'Todos los archivos ya existían completos. No se descargó nada.'
+  })
 
   const watchWire = (wire) => {
     beginDownload()
@@ -165,7 +198,9 @@ function addMagnet(magnet) {
     status: 'buscando',
     message: 'Buscando metadatos y seeders…',
     timer: null,
-    streams: new Set()
+    streams: new Set(),
+    preexistingComplete: new Set(),
+    existingOnly: false
   }
   const registerJob = () => jobs.set(torrent.infoHash, job)
   if (torrent.infoHash) registerJob()
@@ -180,14 +215,22 @@ function addMagnet(magnet) {
   torrent.on('metadata', () => {
     clearTimeout(job.timer)
     job.status = 'verificando'
-    job.message = 'Verificando que exista al menos un seeder completo…'
+    job.message = 'Verificando archivos existentes y buscando un seeder completo…'
     waitForSeeder(torrent, job)
+  })
+
+  torrent.on('ready', () => {
+    job.preexistingComplete = new Set(
+      torrent.files.filter((file) => file.done).map((file) => file.path)
+    )
   })
 
   torrent.on('done', () => {
     clearTimeout(job.timer)
     job.status = 'completo'
-    job.message = 'Descarga completa.'
+    job.message = job.existingOnly
+      ? 'Todos los archivos ya existían completos. No se descargó nada.'
+      : 'Descarga completa.'
   })
 
   torrent.on('error', (error) => {
@@ -288,7 +331,7 @@ app.post('/api/torrents/:id/resume', requireAuth, (req, res) => {
   if (!job) return res.status(404).json({ error: 'Descarga no encontrada.' })
   if (job.status !== 'pausado') return res.status(409).json({ error: 'Esta descarga no está pausada.' })
 
-  job.torrent.files.forEach((file) => file.select())
+  job.torrent.files.filter((file) => !file.done).forEach((file) => file.select())
   job.torrent.resume()
   job.status = 'descargando'
   job.message = 'Descarga reanudada.'
@@ -305,9 +348,15 @@ app.delete('/api/torrents/:id', requireAuth, async (req, res) => {
   job.streams.clear()
   jobs.delete(req.params.id)
 
+  const removableFiles = job.torrent.destroyed ? [] : job.torrent.files
+    .filter((file) => !job.preexistingComplete.has(file.path))
+    .map((file) => path.resolve(DOWNLOAD_DIR, file.path))
+    .filter((absolute) => absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`))
+
   if (!job.torrent.destroyed) {
-    await new Promise((resolve) => job.torrent.destroy({ destroyStore: true }, resolve))
+    await new Promise((resolve) => job.torrent.destroy({ destroyStore: false }, resolve))
   }
+  await Promise.all(removableFiles.map((file) => fs.promises.unlink(file).catch(() => {})))
   res.status(204).end()
 })
 

@@ -4,6 +4,10 @@ App privada y mínima para pegar enlaces magnet, comprobar que exista al menos u
 
 Cada descarga activa puede pausarse y reanudarse. Al cancelar, el torrent se detiene, se quita de la lista y se eliminan sus archivos parciales.
 
+Los videos se muestran como una galería adaptable con miniaturas. En computadora se previsualizan al dejar el mouse encima; en Android, al mantener presionada la miniatura.
+
+Si agregas nuevamente el mismo magnet, la app verifica los datos que ya existen y descarga únicamente los archivos o fragmentos faltantes. Los archivos completos reutilizados tampoco se eliminan al cancelar una reanudación.
+
 ## Antes de ejecutarla
 
 Abre `server.js` y cambia estas constantes:
