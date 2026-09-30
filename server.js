@@ -22,6 +22,7 @@ const PORT = envNumber('PORT', 3250, 1, 65535)
 const TORRENT_PORT = envNumber('TORRENT_PORT', 6881, 1, 65535)
 const DOWNLOAD_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'))
 const STATE_FILE = path.join(DOWNLOAD_DIR, '.magnet-box-state.json')
+const LIBRARY_STATE_FILE = path.join(DOWNLOAD_DIR, '.magnet-box-library.json')
 const APP_USER = process.env.APP_USER || 'admin'
 const APP_PASSWORD = process.env.APP_PASSWORD || 'cambia-esta-clave'
 const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-tambien-esta-frase-larga-y-privada'
@@ -55,8 +56,24 @@ const app = express()
 // TCP funciona en EC2 sin depender del módulo uTP nativo ni de permisos locales extra.
 const client = new WebTorrent({ utp: false, torrentPort: TORRENT_PORT, dhtPort: TORRENT_PORT, maxConns: MAX_CONNECTIONS })
 const jobs = new Map()
+const favoriteVideos = new Set()
 let stateSaveTimer = null
 let stateWriteQueue = Promise.resolve()
+
+try {
+  const savedLibrary = JSON.parse(fs.readFileSync(LIBRARY_STATE_FILE, 'utf8'))
+  for (const relative of savedLibrary.favorites || []) favoriteVideos.add(String(relative))
+} catch (error) {
+  if (error.code !== 'ENOENT') console.error('No se pudieron leer los favoritos:', error.message)
+}
+
+function saveLibraryState() {
+  return fs.promises.writeFile(
+    LIBRARY_STATE_FILE,
+    JSON.stringify({ version: 1, favorites: [...favoriteVideos].sort() }, null, 2),
+    { encoding: 'utf8', mode: 0o600 }
+  )
+}
 
 client.on('error', (error) => console.error('WebTorrent:', error.message))
 
@@ -457,7 +474,7 @@ async function listVideos(directory = DOWNLOAD_DIR, base = DOWNLOAD_DIR, incompl
     const stat = await fs.promises.stat(absolute)
     const relative = path.relative(base, absolute).split(path.sep).join('/')
     if (incomplete.has(relative)) return []
-    return [{ name: entry.name, path: relative, length: stat.size, modifiedAt: stat.mtimeMs, complete: true, progress: 1, streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
+    return [{ name: entry.name, path: relative, length: stat.size, modifiedAt: stat.mtimeMs, complete: true, progress: 1, favorite: favoriteVideos.has(relative), streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
   }))
   return nested.flat()
 }
@@ -670,6 +687,43 @@ app.get('/api/library', requireAuth, async (req, res, next) => {
     videos.sort((left, right) => right.modifiedAt - left.modifiedAt || left.name.localeCompare(right.name))
     res.json(videos)
   } catch (error) {
+    next(error)
+  }
+})
+
+function resolveLibraryVideo(relative) {
+  const normalized = String(relative || '').split('\\').join('/')
+  const absolute = path.resolve(DOWNLOAD_DIR, normalized)
+  const insideDownloadDir = absolute !== DOWNLOAD_DIR && absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`)
+  return insideDownloadDir && isVideo(absolute) ? { normalized, absolute } : null
+}
+
+app.put('/api/library/favorite', requireAuth, async (req, res, next) => {
+  try {
+    const video = resolveLibraryVideo(req.body?.path)
+    if (!video) return res.status(400).json({ error: 'Ruta de video inválida.' })
+    const stat = await fs.promises.stat(video.absolute).catch(() => null)
+    if (!stat?.isFile()) return res.status(404).json({ error: 'El video ya no existe.' })
+    const favorite = Boolean(req.body?.favorite)
+    if (favorite) favoriteVideos.add(video.normalized)
+    else favoriteVideos.delete(video.normalized)
+    await saveLibraryState()
+    res.json({ ok: true, favorite })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/library/video', requireAuth, async (req, res, next) => {
+  try {
+    const video = resolveLibraryVideo(req.body?.path)
+    if (!video) return res.status(400).json({ error: 'Ruta de video inválida.' })
+    await fs.promises.unlink(video.absolute)
+    favoriteVideos.delete(video.normalized)
+    await saveLibraryState()
+    res.status(204).end()
+  } catch (error) {
+    if (error.code === 'ENOENT') return res.status(404).json({ error: 'El video ya no existe.' })
     next(error)
   }
 })
