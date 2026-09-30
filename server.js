@@ -19,6 +19,13 @@ const SESSION_SECRET = 'cambia-tambien-esta-frase-larga-y-privada'
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000
 const SEEDER_TIMEOUT_MS = 90_000
 const STREAM_CHUNK_BYTES = 8 * 1024 * 1024
+const SEARCH_IMPORT_LIMIT = Math.min(100, Math.max(1, Number(process.env.SEARCH_IMPORT_LIMIT) || 50))
+const SEARCH_API_URL = 'https://apibay.org/q.php'
+const MAGNET_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.torrent.eu.org:451/announce'
+]
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.ogv'])
 const MIME_TYPES = {
   '.mp4': 'video/mp4',
@@ -145,6 +152,50 @@ function isMagnet(value) {
   } catch {
     return false
   }
+}
+
+function parseSearchLink(value) {
+  try {
+    const url = new URL(value)
+    if (!['http:','https:'].includes(url.protocol)) return null
+    const host = url.hostname.toLowerCase()
+    if (!host.includes('pirate') && !host.includes('tpb') && host !== 'apibay.org') return null
+    const parts = url.pathname.split('/').filter(Boolean)
+    const searchIndex = parts.findIndex((part) => part.toLowerCase() === 'search')
+    const parameterQuery = url.searchParams.get('q') || url.searchParams.get('query') || url.searchParams.get('search')
+    const query = parameterQuery || (searchIndex >= 0 ? decodeURIComponent(parts[searchIndex + 1] || '') : '')
+    const legacyCategory = searchIndex >= 0 ? parts[searchIndex + 4] : ''
+    const category = url.searchParams.get('cat') || legacyCategory || '0'
+    if (!query?.trim()) return null
+    return {
+      query: query.replace(/\+/g, ' ').trim(),
+      category: /^\d+$/.test(category) ? category : '0'
+    }
+  } catch {
+    return null
+  }
+}
+
+function searchResultMagnet(result) {
+  const hash = String(result.info_hash || '').trim().toLowerCase()
+  if (!/^[a-f0-9]{40}$/.test(hash)) return null
+  const params = new URLSearchParams({ xt: `urn:btih:${hash}`, dn: String(result.name || hash) })
+  MAGNET_TRACKERS.forEach((tracker) => params.append('tr', tracker))
+  return `magnet:?${params}`
+}
+
+async function fetchSearchResults(search) {
+  const url = new URL(SEARCH_API_URL)
+  url.searchParams.set('q', search.query)
+  url.searchParams.set('cat', search.category)
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json', 'User-Agent': 'Magnet-Box/1.0' },
+    signal: AbortSignal.timeout(30_000)
+  })
+  if (!response.ok) throw new Error(`El índice respondió con estado ${response.status}.`)
+  const results = await response.json()
+  if (!Array.isArray(results)) throw new Error('El índice devolvió una respuesta inválida.')
+  return results
 }
 
 function isVideo(name) {
@@ -478,6 +529,57 @@ app.post('/api/torrents', requireAuth, async (req, res) => {
     res.status(202).json({ id, message: 'Magnet agregado. Buscando pares con piezas disponibles…' })
   } catch (error) {
     res.status(400).json({ error: error.message || 'No se pudo agregar el magnet.' })
+  }
+})
+
+app.post('/api/import-search', requireAuth, async (req, res) => {
+  const search = parseSearchLink(String(req.body?.url || '').trim())
+  if (!search) return res.status(400).json({ error: 'Pega una URL válida de resultados de búsqueda.' })
+
+  try {
+    const results = await fetchSearchResults(search)
+    const seen = new Set()
+    const eligible = results
+      .map((result) => ({ ...result, seedCount: Number.parseInt(result.seeders, 10) || 0, magnet: searchResultMagnet(result) }))
+      .filter((result) => result.seedCount > 0 && result.magnet)
+      .sort((left, right) => right.seedCount - left.seedCount)
+      .filter((result) => {
+        const hash = result.info_hash.toLowerCase()
+        if (seen.has(hash)) return false
+        seen.add(hash)
+        return true
+      })
+
+    let added = 0
+    let duplicates = 0
+    let failed = 0
+    for (const result of eligible.slice(0, SEARCH_IMPORT_LIMIT)) {
+      try {
+        if (await client.get(result.magnet)) {
+          duplicates += 1
+          continue
+        }
+        const torrent = addMagnet(result.magnet)
+        await waitForInfoHash(torrent)
+        added += 1
+      } catch {
+        failed += 1
+      }
+    }
+
+    const withoutSeeders = results.filter((result) => (Number.parseInt(result.seeders, 10) || 0) <= 0).length
+    const limited = Math.max(0, eligible.length - SEARCH_IMPORT_LIMIT)
+    const details = [
+      `${added} agregados`,
+      `${withoutSeeders} ignorados sin seeders`,
+      duplicates ? `${duplicates} duplicados` : '',
+      failed ? `${failed} con error` : '',
+      limited ? `${limited} omitidos por el límite de ${SEARCH_IMPORT_LIMIT}` : ''
+    ].filter(Boolean).join(' · ')
+    res.status(202).json({ added, withoutSeeders, duplicates, failed, limited, message: `Importación terminada: ${details}.` })
+  } catch (error) {
+    const timeout = error.name === 'TimeoutError' || error.name === 'AbortError'
+    res.status(502).json({ error: timeout ? 'El índice tardó demasiado en responder.' : (error.message || 'No se pudo consultar el índice.') })
   }
 })
 

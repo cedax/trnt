@@ -70,6 +70,7 @@
     .field:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(103,232,182,.1); }
     .login .primary { width:100%; margin-top:20px; }
     .message { min-height:24px; color:var(--danger); font-size:.88rem; margin:10px 0 0; }
+    .message.ok { color:var(--accent); }
     .browse-tools { display:grid; grid-template-columns:minmax(220px,1fr) auto auto; gap:9px; margin:4px 0 24px; }
     .tool-input,.tool-select { min-width:0; border:1px solid var(--line); background:#0d131a; color:var(--text); border-radius:10px; padding:10px 12px; outline:0; }
     .tool-input:focus,.tool-select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(103,232,182,.1); }
@@ -125,11 +126,11 @@
         <button class="ghost" id="logoutButton">Salir</button>
       </header>
       <h1>Un magnet.<br>Directo a tu pantalla.</h1>
-      <p class="muted">Verifica lo que ya existe y descarga únicamente las piezas que faltan.</p>
+      <p class="muted">Pega un magnet o una URL de búsqueda de Pirate Bay. Las importaciones omiten resultados sin seeders.</p>
 
       <form class="add-box" id="magnetForm">
-        <input id="magnetInput" aria-label="Enlace magnet" placeholder="magnet:?xt=urn:btih:…" autocomplete="off" required>
-        <button class="primary" type="submit">Agregar descarga</button>
+        <input id="magnetInput" aria-label="Enlace magnet o búsqueda" placeholder="magnet:?… o URL de búsqueda" autocomplete="off" required>
+        <button class="primary" type="submit">Agregar o importar</button>
       </form>
       <p class="message" id="addMessage" role="status"></p>
 
@@ -539,14 +540,28 @@
     $('#magnetForm').addEventListener('submit', async (event) => {
       event.preventDefault()
       const button = event.target.querySelector('button')
+      const value = $('#magnetInput').value.trim()
+      const isMagnetLink = value.toLowerCase().startsWith('magnet:')
       button.disabled = true
+      button.textContent = isMagnetLink ? 'Agregando…' : 'Importando…'
       $('#addMessage').textContent = ''
+      $('#addMessage').classList.remove('ok')
       try {
-        await api('/api/torrents', { method:'POST', body:JSON.stringify({ magnet:$('#magnetInput').value }) })
+        const result = await api(isMagnetLink ? '/api/torrents' : '/api/import-search', {
+          method:'POST',
+          body:JSON.stringify(isMagnetLink ? { magnet:value } : { url:value })
+        })
         event.target.reset()
+        $('#addMessage').textContent = result?.message || 'Agregado correctamente.'
+        $('#addMessage').classList.add('ok')
         await refresh()
-      } catch (error) { $('#addMessage').textContent = error.message }
-      finally { button.disabled = false }
+      } catch (error) {
+        $('#addMessage').classList.remove('ok')
+        $('#addMessage').textContent = error.message
+      } finally {
+        button.disabled = false
+        button.textContent = 'Agregar o importar'
+      }
     })
 
     document.addEventListener('click', async (event) => {

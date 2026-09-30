@@ -2,6 +2,8 @@
 
 App privada y mínima para pegar enlaces magnet, comprobar que existan pares con piezas útiles, descargar a disco y reproducir videos desde el navegador.
 
+El mismo campo acepta una URL de resultados de búsqueda de Pirate Bay. La app extrae la consulta, usa la API JSON pública, ignora los resultados que reportan cero seeders, elimina duplicados e importa hasta 50 torrents por operación. Puedes cambiar ese máximo con `SEARCH_IMPORT_LIMIT` (entre 1 y 100). El número publicado de seeders es orientativo; cada torrent sigue pasando después por la comprobación real de pares de Magnet Box.
+
 Cada descarga activa puede pausarse y reanudarse. Al cancelar, el torrent se detiene, se quita de la lista y se eliminan sus archivos parciales.
 
 Los videos se muestran como una galería adaptable con miniaturas. En computadora se previsualizan al dejar el mouse encima; en Android, al mantener presionada la miniatura.
