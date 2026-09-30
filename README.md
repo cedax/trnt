@@ -6,9 +6,13 @@ Cada descarga activa puede pausarse y reanudarse. Al cancelar, el torrent se det
 
 Los videos se muestran como una galería adaptable con miniaturas. En computadora se previsualizan al dejar el mouse encima; en Android, al mantener presionada la miniatura.
 
+La barra de búsqueda encuentra torrents y videos por nombre. También puedes filtrar por estado, ordenar los resultados y quitar una descarga completa de la lista sin borrar sus archivos.
+
 Si agregas nuevamente el mismo magnet, la app verifica los datos que ya existen y descarga únicamente los archivos o fragmentos faltantes. Los archivos completos reutilizados tampoco se eliminan al cancelar una reanudación.
 
 El estado se guarda en `downloads/.magnet-box-state.json`: magnets, metadatos del torrent, piezas verificadas, pausa y fechas de modificación. Al reiniciar el servicio, las descargas se restauran automáticamente y los archivos sin cambios usan una verificación rápida en lugar de recalcular todos sus hashes.
+
+Los torrents nuevos se guardan en carpetas independientes identificadas por su hash para impedir que dos descargas con nombres iguales oculten o sobrescriban archivos. Las descargas creadas con versiones anteriores conservan su ubicación original.
 
 ## Antes de ejecutarla
 

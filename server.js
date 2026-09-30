@@ -53,6 +53,14 @@ function scheduleStateSave(delay = 500) {
 
 async function captureFileModtimes(job) {
   if (!job.torrent?.ready || job.torrent.destroyed) return
+  if (job.addUID) {
+    job.fileModtimes = await Promise.all(job.torrent.files.map(async (file) => {
+      const absolute = path.join(DOWNLOAD_DIR, torrentStorageRelativePath(job, file))
+      const stat = await fs.promises.stat(absolute).catch(() => null)
+      return stat?.mtimeMs
+    }))
+    return
+  }
   job.fileModtimes = await new Promise((resolve) => {
     job.torrent.getFileModtimes((error, values) => resolve(error ? null : values))
   })
@@ -68,6 +76,8 @@ async function saveStateNow() {
       bitfield: torrent?.bitfield ? encodeBytes(torrent.bitfield.buffer) : job.cachedBitfield,
       torrentFile: torrent?.torrentFile ? encodeBytes(torrent.torrentFile) : job.cachedTorrentFile,
       announce: torrent?.announce || job.cachedAnnounce || [],
+      addUID: job.addUID,
+      createdAt: job.createdAt,
       fileModtimes: job.fileModtimes || null,
       updatedAt: Date.now()
     }
@@ -141,6 +151,13 @@ function isVideo(name) {
   return VIDEO_EXTENSIONS.has(path.extname(name).toLowerCase())
 }
 
+function torrentStorageRelativePath(job, file) {
+  const relative = job.addUID
+    ? path.join(`${job.torrent.name} - ${job.torrent.infoHash.slice(0, 8)}`, file.path)
+    : file.path
+  return relative.split(path.sep).join('/')
+}
+
 function formatTorrent(torrent, job) {
   const canStream = ['descargando', 'completo'].includes(job.status)
   return {
@@ -153,6 +170,7 @@ function formatTorrent(torrent, job) {
     length: torrent.length || 0,
     speed: torrent.downloadSpeed || 0,
     peers: torrent.numPeers || 0,
+    createdAt: job.createdAt,
     files: (torrent.files || []).map((file, index) => ({
       index,
       name: file.name,
@@ -255,30 +273,34 @@ function waitForSources(torrent, job) {
   }, SEEDER_TIMEOUT_MS)
 }
 
-function addMagnet(magnet, resumeState = {}) {
+function addMagnet(magnet, resumeState = null) {
+  const saved = resumeState || {}
+  const addUID = resumeState ? Boolean(saved.addUID) : true
   // Descubre pares y metadatos, pero no solicita piezas todavía.
-  const options = { path: DOWNLOAD_DIR, deselect: true }
-  if (resumeState.bitfield) options.bitfield = Buffer.from(resumeState.bitfield, 'base64')
-  if (resumeState.complete && Array.isArray(resumeState.fileModtimes)) options.fileModtimes = resumeState.fileModtimes
-  if (Array.isArray(resumeState.announce)) options.announce = resumeState.announce
-  const torrentSource = resumeState.torrentFile
-    ? Buffer.from(resumeState.torrentFile, 'base64')
+  const options = { path: DOWNLOAD_DIR, deselect: true, addUID }
+  if (saved.bitfield) options.bitfield = Buffer.from(saved.bitfield, 'base64')
+  if (!addUID && saved.complete && Array.isArray(saved.fileModtimes)) options.fileModtimes = saved.fileModtimes
+  if (Array.isArray(saved.announce)) options.announce = saved.announce
+  const torrentSource = saved.torrentFile
+    ? Buffer.from(saved.torrentFile, 'base64')
     : magnet
   const torrent = client.add(torrentSource, options)
   const job = {
     torrent,
     magnet,
     status: 'buscando',
-    message: resumeState.torrentFile ? 'Restaurando torrent desde la caché…' : 'Buscando metadatos y pares…',
+    message: saved.torrentFile ? 'Restaurando torrent desde la caché…' : 'Buscando metadatos y pares…',
     timer: null,
     streams: new Set(),
     preexistingComplete: new Set(),
     existingOnly: false,
-    restorePaused: Boolean(resumeState.paused),
-    cachedBitfield: resumeState.bitfield || null,
-    cachedTorrentFile: resumeState.torrentFile || null,
-    cachedAnnounce: resumeState.announce || [],
-    fileModtimes: resumeState.fileModtimes || null
+    restorePaused: Boolean(saved.paused),
+    cachedBitfield: saved.bitfield || null,
+    cachedTorrentFile: saved.torrentFile || null,
+    cachedAnnounce: saved.announce || [],
+    fileModtimes: saved.fileModtimes || null,
+    addUID,
+    createdAt: saved.createdAt || Date.now()
   }
   const registerJob = () => {
     jobs.set(torrent.infoHash, job)
@@ -298,7 +320,7 @@ function addMagnet(magnet, resumeState = {}) {
     job.cachedTorrentFile = encodeBytes(torrent.torrentFile)
     job.cachedAnnounce = torrent.announce || []
     job.status = 'verificando'
-    job.message = resumeState.bitfield
+    job.message = saved.bitfield
       ? 'Usando la caché para comprobar rápidamente los archivos…'
       : 'Verificando archivos existentes y buscando piezas disponibles…'
     waitForSources(torrent, job)
@@ -356,7 +378,7 @@ function incompleteTorrentPaths() {
   const paths = new Set()
   for (const job of jobs.values()) {
     for (const file of job.torrent.files || []) {
-      if (!file.done) paths.add(file.path.split(path.sep).join('/'))
+      if (!file.done) paths.add(torrentStorageRelativePath(job, file))
     }
   }
   return paths
@@ -371,7 +393,7 @@ async function listVideos(directory = DOWNLOAD_DIR, base = DOWNLOAD_DIR, incompl
     const stat = await fs.promises.stat(absolute)
     const relative = path.relative(base, absolute).split(path.sep).join('/')
     if (incomplete.has(relative)) return []
-    return [{ name: entry.name, path: relative, length: stat.size, complete: true, progress: 1, streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
+    return [{ name: entry.name, path: relative, length: stat.size, modifiedAt: stat.mtimeMs, complete: true, progress: 1, streamUrl: `/media?file=${encodeURIComponent(relative)}` }]
   }))
   return nested.flat()
 }
@@ -501,7 +523,7 @@ app.delete('/api/torrents/:id', requireAuth, async (req, res) => {
 
   const removableFiles = job.torrent.destroyed ? [] : job.torrent.files
     .filter((file) => !job.preexistingComplete.has(file.path))
-    .map((file) => path.resolve(DOWNLOAD_DIR, file.path))
+    .map((file) => path.resolve(DOWNLOAD_DIR, torrentStorageRelativePath(job, file)))
     .filter((absolute) => absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`))
 
   if (!job.torrent.destroyed) {
@@ -512,9 +534,26 @@ app.delete('/api/torrents/:id', requireAuth, async (req, res) => {
   res.status(204).end()
 })
 
+app.delete('/api/torrents/:id/forget', requireAuth, async (req, res) => {
+  const job = jobs.get(req.params.id)
+  if (!job) return res.status(404).json({ error: 'Descarga no encontrada.' })
+  if (job.status !== 'completo') return res.status(409).json({ error: 'Solo puedes quitar descargas completas.' })
+
+  job.streams.forEach((stream) => stream.destroy())
+  job.streams.clear()
+  jobs.delete(req.params.id)
+  if (!job.torrent.destroyed) {
+    await new Promise((resolve) => job.torrent.destroy({ destroyStore: false }, resolve))
+  }
+  scheduleStateSave(0)
+  res.status(204).end()
+})
+
 app.get('/api/library', requireAuth, async (req, res, next) => {
   try {
-    res.json(await listVideos())
+    const videos = await listVideos()
+    videos.sort((left, right) => right.modifiedAt - left.modifiedAt || left.name.localeCompare(right.name))
+    res.json(videos)
   } catch (error) {
     next(error)
   }
@@ -536,7 +575,7 @@ app.get('/api/torrents/:id/files/:index/stream', requireAuth, async (req, res) =
   res.setHeader('Cache-Control', job.status === 'completo' ? 'private, max-age=3600' : 'private, no-store')
 
   if (file.done) {
-    const absolute = path.resolve(DOWNLOAD_DIR, file.path)
+    const absolute = path.resolve(DOWNLOAD_DIR, torrentStorageRelativePath(job, file))
     if (!absolute.startsWith(`${DOWNLOAD_DIR}${path.sep}`)) return res.status(404).end()
     return res.sendFile(absolute, (error) => {
       if (error && !res.headersSent) res.status(error.statusCode || 404).end()

@@ -70,6 +70,11 @@
     .field:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(103,232,182,.1); }
     .login .primary { width:100%; margin-top:20px; }
     .message { min-height:24px; color:var(--danger); font-size:.88rem; margin:10px 0 0; }
+    .browse-tools { display:grid; grid-template-columns:minmax(220px,1fr) auto auto; gap:9px; margin:4px 0 24px; }
+    .tool-input,.tool-select { min-width:0; border:1px solid var(--line); background:#0d131a; color:var(--text); border-radius:10px; padding:10px 12px; outline:0; }
+    .tool-input:focus,.tool-select:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(103,232,182,.1); }
+    .tool-input::placeholder { color:#697587; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     dialog { width:min(900px,calc(100% - 24px)); border:1px solid var(--line); border-radius:16px; padding:0; background:#050709; color:var(--text); box-shadow:0 30px 100px #000; }
     dialog::backdrop { background:rgba(0,0,0,.8); backdrop-filter:blur(5px); }
     .player-head { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:4px 12px; padding:12px 15px; }
@@ -82,6 +87,8 @@
       h1{font-size:2.35rem}
       .add-box{grid-template-columns:minmax(0,1fr);margin-bottom:28px}
       .add-box .primary{width:100%}
+      .browse-tools{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+      .browse-tools .tool-input{grid-column:1/-1}
       .card{padding:14px;border-radius:14px}
       .card-top{display:block}
       .status{display:block;margin-top:8px}
@@ -126,6 +133,26 @@
       </form>
       <p class="message" id="addMessage" role="status"></p>
 
+      <div class="browse-tools" role="search">
+        <label class="sr-only" for="searchInput">Buscar torrents o videos</label>
+        <input class="tool-input" id="searchInput" type="search" placeholder="Buscar descarga o video…" autocomplete="off">
+        <label class="sr-only" for="statusFilter">Filtrar estado</label>
+        <select class="tool-select" id="statusFilter">
+          <option value="all">Todos los estados</option>
+          <option value="active">Activos</option>
+          <option value="complete">Completos</option>
+          <option value="paused">Pausados</option>
+          <option value="waiting">Esperando</option>
+        </select>
+        <label class="sr-only" for="sortMode">Ordenar resultados</label>
+        <select class="tool-select" id="sortMode">
+          <option value="recent">Más recientes</option>
+          <option value="name">Nombre A–Z</option>
+          <option value="size">Mayor tamaño</option>
+          <option value="progress">Mayor progreso</option>
+        </select>
+      </div>
+
       <section>
         <div class="section-head"><h2>Descargas</h2><span class="muted" id="downloadCount">0 activas</span></div>
         <div class="downloads-grid" id="downloads"></div>
@@ -164,6 +191,7 @@
     let refreshTimer
     let lastLibraryRefresh = 0
     let refreshInFlight = null
+    let completedTorrentIds = new Set()
 
     const thumbnailObserver = 'IntersectionObserver' in window
       ? new IntersectionObserver((entries) => {
@@ -192,6 +220,42 @@
 
     function escapeHtml(value = '') {
       return value.replace(/[&<>'"]/g, (char) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]))
+    }
+
+    function normalized(value = '') {
+      return String(value).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+    }
+
+    function currentQuery() {
+      return normalized($('#searchInput').value.trim())
+    }
+
+    function matchesSearch(item) {
+      const query = currentQuery()
+      if (!query) return true
+      return normalized([item.name,item.path,...(item.files || []).map((file) => file.name)].filter(Boolean).join(' ')).includes(query)
+    }
+
+    function matchesStatus(item) {
+      const filter = $('#statusFilter').value
+      if (filter === 'all') return true
+      if (filter === 'complete') return item.status === 'completo'
+      if (filter === 'paused') return item.status === 'pausado'
+      if (filter === 'waiting') return ['buscando','verificando','esperando'].includes(item.status)
+      if (filter === 'active') return ['buscando','verificando','esperando','descargando'].includes(item.status)
+      return true
+    }
+
+    function sortItems(items, library = false) {
+      const mode = $('#sortMode').value
+      return [...items].sort((left,right) => {
+        if (mode === 'name') return left.name.localeCompare(right.name,undefined,{ sensitivity:'base' })
+        if (mode === 'size') return (right.length || 0) - (left.length || 0)
+        if (mode === 'progress') return (right.progress || 0) - (left.progress || 0)
+        return library
+          ? (right.modifiedAt || 0) - (left.modifiedAt || 0)
+          : (right.createdAt || 0) - (left.createdAt || 0)
+      })
     }
 
     function showLogin() {
@@ -367,11 +431,17 @@
 
     function renderTorrents(items) {
       lastTorrentItems = items
+      const nextCompletedIds = new Set(items.filter((item) => item.status === 'completo').map((item) => item.id))
+      if ([...nextCompletedIds].some((id) => !completedTorrentIds.has(id))) lastLibraryRefresh = 0
+      completedTorrentIds = nextCompletedIds
       const active = items.filter((item) => !['completo','sin-seeders','error'].includes(item.status)).length
-      $('#downloadCount').textContent = `${active} ${active === 1 ? 'activa' : 'activas'}`
-      const nextStructureKey = JSON.stringify(items.map((item) => [item.id,item.name,item.status,item.message,item.files.map((file) => [file.name,file.video]),expandedGalleries.has(item.id)]))
+      const displayItems = sortItems(items.filter((item) => matchesSearch(item) && matchesStatus(item)))
+      $('#downloadCount').textContent = displayItems.length === items.length
+        ? `${items.length} ${items.length === 1 ? 'descarga' : 'descargas'} · ${active} ${active === 1 ? 'activa' : 'activas'}`
+        : `${displayItems.length} de ${items.length}`
+      const nextStructureKey = JSON.stringify([currentQuery(),$('#statusFilter').value,$('#sortMode').value,displayItems.map((item) => [item.id,item.name,item.status,item.message,item.files.map((file) => [file.name,file.video]),expandedGalleries.has(item.id)])])
       if (nextStructureKey === torrentStructureKey) {
-        items.forEach((item) => {
+        displayItems.forEach((item) => {
           const card = document.getElementById(`torrent-${item.id}`)
           if (!card) return
           card.querySelector('.js-progress').style.width = `${Math.round(item.progress * 100)}%`
@@ -393,7 +463,7 @@
       torrentStructureKey = nextStructureKey
       const downloads = $('#downloads')
       disposeMedia(downloads)
-      downloads.innerHTML = items.length ? items.map((item) => {
+      downloads.innerHTML = displayItems.length ? displayItems.map((item) => {
         const percent = Math.round(item.progress * 100)
         const bad = ['sin-seeders','error'].includes(item.status)
         const paused = item.status === 'pausado'
@@ -406,26 +476,31 @@
         const pauseButton = item.status === 'descargando' ? `<button class="control" data-action="pause" data-id="${item.id}">Ⅱ Pausar</button>` : ''
         const resumeButton = paused ? `<button class="control" data-action="resume" data-id="${item.id}">▶ Reanudar</button>` : ''
         const cancelButton = item.status !== 'completo' ? `<button class="control danger" data-action="cancel" data-id="${item.id}">Cancelar</button>` : ''
-        const actions = pauseButton || resumeButton || cancelButton ? `<div class="torrent-actions">${pauseButton}${resumeButton}${cancelButton}</div>` : ''
+        const forgetButton = item.status === 'completo' ? `<button class="control" data-action="forget" data-id="${item.id}" title="Conserva los archivos descargados">Quitar de la lista</button>` : ''
+        const actions = pauseButton || resumeButton || cancelButton || forgetButton ? `<div class="torrent-actions">${pauseButton}${resumeButton}${cancelButton}${forgetButton}</div>` : ''
         return `<article class="card torrent-card" id="torrent-${item.id}"><div class="card-top"><div><div class="title">${escapeHtml(item.name)}</div><div class="meta">${escapeHtml(item.message)} · <span class="js-peers">${item.peers} pares</span></div></div><span class="status ${bad ? 'bad' : ''} ${paused ? 'paused' : ''}">${escapeHtml(item.status)}</span></div><div class="progress"><div class="js-progress" style="width:${percent}%"></div></div><div class="meta js-stats">${percent}% · ${humanBytes(item.downloaded)} de ${humanBytes(item.length)} · ${humanBytes(item.speed)}/s</div>${files}${actions}</article>`
-      }).join('') : '<div class="empty">Aún no hay descargas. Pega tu primer magnet arriba.</div>'
+      }).join('') : `<div class="empty">${items.length ? 'No hay descargas que coincidan con la búsqueda o el filtro.' : 'Aún no hay descargas. Pega tu primer magnet arriba.'}</div>`
       activateMediaCards(downloads)
     }
 
     function renderLibrary(items) {
       lastLibraryItems = items
-      $('#libraryCount').textContent = `${items.length} ${items.length === 1 ? 'video' : 'videos'}`
-      const nextStructureKey = JSON.stringify([libraryLimit,items.map((item) => [item.path,item.length])])
+      const statusAllowsLibrary = ['all','complete'].includes($('#statusFilter').value)
+      const displayItems = statusAllowsLibrary ? sortItems(items.filter(matchesSearch),true) : []
+      $('#libraryCount').textContent = displayItems.length === items.length
+        ? `${items.length} ${items.length === 1 ? 'video' : 'videos'}`
+        : `${displayItems.length} de ${items.length}`
+      const nextStructureKey = JSON.stringify([currentQuery(),$('#statusFilter').value,$('#sortMode').value,libraryLimit,displayItems.map((item) => [item.path,item.length,item.modifiedAt])])
       if (nextStructureKey === libraryStructureKey) return
       libraryStructureKey = nextStructureKey
       const library = $('#library')
       disposeMedia(library)
-      if (!items.length) {
-        library.innerHTML = '<div class="empty">Los videos descargados aparecerán aquí.</div>'
+      if (!displayItems.length) {
+        library.innerHTML = `<div class="empty">${items.length ? 'No hay videos que coincidan con la búsqueda o el filtro.' : 'Los videos descargados aparecerán aquí.'}</div>`
         return
       }
-      const visible = items.slice(0,libraryLimit).map(mediaCard).join('')
-      const more = items.length > libraryLimit ? `<button class="gallery-more" data-library-more>Mostrar ${Math.min(18,items.length-libraryLimit)} más</button>` : ''
+      const visible = displayItems.slice(0,libraryLimit).map(mediaCard).join('')
+      const more = displayItems.length > libraryLimit ? `<button class="gallery-more" data-library-more>Mostrar ${Math.min(18,displayItems.length-libraryLimit)} más</button>` : ''
       library.innerHTML = visible + more
       activateMediaCards(library)
     }
@@ -502,15 +577,17 @@
       if (!control) return
       const { action, id } = control.dataset
       if (action === 'cancel' && !confirm('¿Cancelar esta descarga y eliminar sus archivos parciales?')) return
+      if (action === 'forget' && !confirm('¿Quitar esta descarga de la lista? Los archivos se conservarán en la biblioteca.')) return
 
       control.disabled = true
       $('#addMessage').textContent = ''
       try {
         playerDialog.close?.()
-        const method = action === 'cancel' ? 'DELETE' : 'POST'
+        const method = ['cancel','forget'].includes(action) ? 'DELETE' : 'POST'
         const suffix = action === 'cancel' ? '' : `/${action}`
         await api(`/api/torrents/${id}${suffix}`, { method })
-        await refresh(action === 'cancel')
+        lastLibraryRefresh = 0
+        await refresh(['cancel','forget'].includes(action))
       } catch (error) {
         $('#addMessage').textContent = error.message
         control.disabled = false
@@ -552,6 +629,25 @@
     })
     document.addEventListener('contextmenu', (event) => {
       if (event.target.closest('.media-card')) event.preventDefault()
+    })
+    $('#searchInput').addEventListener('input', () => {
+      libraryLimit = 18
+      torrentStructureKey = ''
+      libraryStructureKey = ''
+      renderTorrents(lastTorrentItems)
+      renderLibrary(lastLibraryItems)
+    })
+    $('#statusFilter').addEventListener('change', () => {
+      torrentStructureKey = ''
+      libraryStructureKey = ''
+      renderTorrents(lastTorrentItems)
+      renderLibrary(lastLibraryItems)
+    })
+    $('#sortMode').addEventListener('change', () => {
+      torrentStructureKey = ''
+      libraryStructureKey = ''
+      renderTorrents(lastTorrentItems)
+      renderLibrary(lastLibraryItems)
     })
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) stopPreview(activePreviewCard)
