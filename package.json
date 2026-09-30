@@ -9,11 +9,10 @@
     "check": "node --check server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "dependencies": {
     "express": "5.2.1",
-    "magnet-box": "file:",
     "webtorrent": "3.0.21"
   }
 }

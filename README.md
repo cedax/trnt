@@ -18,30 +18,31 @@ Los torrents nuevos se guardan en carpetas independientes identificadas por su h
 
 ## Antes de ejecutarla
 
-Abre `server.js` y cambia estas constantes:
+La configuración privada está en `.env`, que Git ignora. En un servidor nuevo, crea el archivo a partir del ejemplo:
 
-```js
-const APP_USER = 'admin'
-const APP_PASSWORD = 'cambia-esta-clave'
-const SESSION_SECRET = 'cambia-tambien-esta-frase-larga-y-privada'
+```bash
+cp .env.example .env
+nano .env
 ```
+
+Cambia como mínimo `APP_USER`, `APP_PASSWORD` y `SESSION_SECRET`. También puedes configurar los puertos, carpeta de descargas, duración de sesión, conexiones máximas, trackers y opciones de importación desde ese archivo.
 
 La contraseña solo existe en el backend. El navegador envía lo que escribes en el formulario y conserva únicamente una cookie de sesión `HttpOnly`.
 
 ## Ejecutar
 
-Requiere Node.js 20 o superior.
+Requiere Node.js 20.12 o superior.
 
 ```bash
 npm install
 npm start
 ```
 
-Abre `http://IP-DEL-SERVIDOR:3250`. Los archivos se guardan en `./downloads`. Puedes cambiar la ruta con `DOWNLOAD_DIR=/ruta/grande`, el puerto web con `PORT=3250` y el puerto BitTorrent con `TORRENT_PORT=6881`.
+Abre `http://IP-DEL-SERVIDOR:3250`. Los archivos se guardan en `./downloads`; ambos valores pueden cambiarse en `.env`.
 
 ## EC2
 
-En Ubuntu, instala Node.js 20+, copia esta carpeta, ejecuta `npm install --omit=dev` y arranca con `npm start`. Para dejarlo permanente puedes usar `pm2`:
+En Ubuntu, instala Node.js 20.12+, copia esta carpeta y `.env`, ejecuta `npm install --omit=dev` y arranca con `npm start`. Para dejarlo permanente puedes usar `pm2`:
 
 ```bash
 sudo npm install -g pm2

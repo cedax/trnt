@@ -1,31 +1,43 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { loadEnvFile } from 'node:process'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 import WebTorrent from 'webtorrent'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PORT = Number(process.env.PORT || 3250)
-const TORRENT_PORT = Number(process.env.TORRENT_PORT || 6881)
+try {
+  loadEnvFile(path.join(__dirname, '.env'))
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error
+}
+
+function envNumber(name, fallback, minimum, maximum) {
+  const value = Number(process.env[name])
+  return Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, value)) : fallback
+}
+
+const PORT = envNumber('PORT', 3250, 1, 65535)
+const TORRENT_PORT = envNumber('TORRENT_PORT', 6881, 1, 65535)
 const DOWNLOAD_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'))
 const STATE_FILE = path.join(DOWNLOAD_DIR, '.magnet-box-state.json')
-
-// Cambia estos tres valores antes de publicar la aplicación.
-const APP_USER = 'admin'
-const APP_PASSWORD = 'cambia-esta-clave'
-const SESSION_SECRET = 'cambia-tambien-esta-frase-larga-y-privada'
-
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000
-const SEEDER_TIMEOUT_MS = 90_000
-const STREAM_CHUNK_BYTES = 8 * 1024 * 1024
-const SEARCH_IMPORT_LIMIT = Math.min(100, Math.max(1, Number(process.env.SEARCH_IMPORT_LIMIT) || 50))
-const SEARCH_API_URL = 'https://apibay.org/q.php'
-const MAGNET_TRACKERS = [
+const APP_USER = process.env.APP_USER || 'admin'
+const APP_PASSWORD = process.env.APP_PASSWORD || 'cambia-esta-clave'
+const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-tambien-esta-frase-larga-y-privada'
+const SESSION_TTL_MS = envNumber('SESSION_TTL_HOURS', 24, 1, 24 * 30) * 60 * 60 * 1000
+const SEEDER_TIMEOUT_MS = envNumber('SEEDER_TIMEOUT_SECONDS', 90, 10, 3600) * 1000
+const STREAM_CHUNK_BYTES = envNumber('STREAM_CHUNK_MB', 8, 1, 64) * 1024 * 1024
+const SEARCH_IMPORT_LIMIT = envNumber('SEARCH_IMPORT_LIMIT', 50, 1, 100)
+const SEARCH_API_URL = process.env.SEARCH_API_URL || 'https://apibay.org/q.php'
+const SEARCH_TIMEOUT_MS = envNumber('SEARCH_TIMEOUT_SECONDS', 30, 5, 120) * 1000
+const MAX_CONNECTIONS = envNumber('MAX_CONNECTIONS', 55, 10, 500)
+const TRUST_PROXY = /^\d+$/.test(process.env.TRUST_PROXY || '') ? Number(process.env.TRUST_PROXY) : (process.env.TRUST_PROXY || 1)
+const MAGNET_TRACKERS = (process.env.MAGNET_TRACKERS || [
   'udp://tracker.opentrackr.org:1337/announce',
   'udp://open.stealth.si:80/announce',
   'udp://tracker.torrent.eu.org:451/announce'
-]
+].join(',')).split(',').map((tracker) => tracker.trim()).filter(Boolean)
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi', '.ogv'])
 const MIME_TYPES = {
   '.mp4': 'video/mp4',
@@ -41,7 +53,7 @@ fs.mkdirSync(DOWNLOAD_DIR, { recursive: true })
 
 const app = express()
 // TCP funciona en EC2 sin depender del módulo uTP nativo ni de permisos locales extra.
-const client = new WebTorrent({ utp: false, torrentPort: TORRENT_PORT, dhtPort: TORRENT_PORT })
+const client = new WebTorrent({ utp: false, torrentPort: TORRENT_PORT, dhtPort: TORRENT_PORT, maxConns: MAX_CONNECTIONS })
 const jobs = new Map()
 let stateSaveTimer = null
 let stateWriteQueue = Promise.resolve()
@@ -100,7 +112,7 @@ async function saveStateNow() {
 const stateCheckpoint = setInterval(() => scheduleStateSave(0), 10_000)
 stateCheckpoint.unref?.()
 
-app.set('trust proxy', 1)
+app.set('trust proxy', TRUST_PROXY)
 app.disable('x-powered-by')
 app.use(express.json({ limit: '32kb' }))
 
@@ -179,9 +191,10 @@ function parseSearchLink(value) {
 function searchResultMagnet(result) {
   const hash = String(result.info_hash || '').trim().toLowerCase()
   if (!/^[a-f0-9]{40}$/.test(hash)) return null
-  const params = new URLSearchParams({ xt: `urn:btih:${hash}`, dn: String(result.name || hash) })
-  MAGNET_TRACKERS.forEach((tracker) => params.append('tr', tracker))
-  return `magnet:?${params}`
+  const name = encodeURIComponent(String(result.name || hash))
+  const trackers = MAGNET_TRACKERS.map((tracker) => `&tr=${encodeURIComponent(tracker)}`).join('')
+  // WebTorrent requiere que "urn:btih:" conserve los dos puntos sin codificar.
+  return `magnet:?xt=urn:btih:${hash}&dn=${name}${trackers}`
 }
 
 async function fetchSearchResults(search) {
@@ -190,7 +203,7 @@ async function fetchSearchResults(search) {
   url.searchParams.set('cat', search.category)
   const response = await fetch(url, {
     headers: { Accept: 'application/json', 'User-Agent': 'Magnet-Box/1.0' },
-    signal: AbortSignal.timeout(30_000)
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
   })
   if (!response.ok) throw new Error(`El índice respondió con estado ${response.status}.`)
   const results = await response.json()
